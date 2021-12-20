@@ -65,7 +65,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rust-irc"
+name = "rust_irc"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
