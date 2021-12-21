@@ -36,8 +36,8 @@ impl ToString for NumericReply {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct IrcConnection {
-    client_addr: SocketAddr,
-    server_addr: SocketAddr,
+    pub client_addr: SocketAddr,
+    pub server_addr: SocketAddr,
     stream: BufWriter<BufReader<TcpStream>>,
 }
 
@@ -190,8 +190,17 @@ impl IrcConnection {
         Ok(())
     }
 
-    pub async fn write_pong(&mut self) -> Result<()> {
-        format_write!(self.stream, "PONG {}", self.server_addr.ip());
+    pub async fn write_pong<S: AsRef<str>>(&mut self, discrimator: S) -> Result<()> {
+        println!(
+            "Writing: {:?}",
+            format!("PONG {} {}", self.server_addr.ip(), discrimator.as_ref())
+        );
+        format_write!(
+            self.stream,
+            "PONG {} {}",
+            self.server_addr.ip(),
+            discrimator.as_ref()
+        );
         Ok(())
     }
 
@@ -206,6 +215,12 @@ impl IrcConnection {
             .await?;
         self.write_numeric(client, NumericReply::RPL_MOTD, "End of /MOTD command")
             .await?;
+        Ok(())
+    }
+
+    /// SAFETY: You have to end `message` with a \r\n or bad shit will happen.
+    pub async unsafe fn write_raw<S: AsRef<str>>(&mut self, message: S) -> Result<()> {
+        format_write!(self.stream, "{}", message.as_ref());
         Ok(())
     }
 }

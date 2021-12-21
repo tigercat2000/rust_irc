@@ -6,13 +6,15 @@ type Source = String;
 type Parameter = String;
 
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
-#[derive(Debug)]
-enum CommandType {
+#[derive(Debug, Clone)]
+pub enum CommandType {
     NICK,
     USER,
     PING,
     MOTD,
     QUIT,
+    PRIVMSG,
+    JOIN,
     UNKNOWN(String),
 }
 
@@ -25,6 +27,8 @@ impl FromStr for CommandType {
             "PING" => Ok(Self::PING),
             "MOTD" => Ok(Self::MOTD),
             "QUIT" => Ok(Self::QUIT),
+            "PRIVMSG" => Ok(Self::PRIVMSG),
+            "JOIN" => Ok(Self::JOIN),
             _ => {
                 eprintln!("UNKNOWN Command: {:?}", s.to_uppercase());
                 Ok(Self::UNKNOWN(s.to_uppercase()))
@@ -33,23 +37,69 @@ impl FromStr for CommandType {
     }
 }
 
-#[derive(Debug)]
+impl ToString for CommandType {
+    fn to_string(&self) -> String {
+        match self {
+            CommandType::NICK => "NICK",
+            CommandType::USER => "USER",
+            CommandType::PING => "PING",
+            CommandType::MOTD => "MOTD",
+            CommandType::QUIT => "QUIT",
+            CommandType::PRIVMSG => "PRIVMSG",
+            CommandType::JOIN => "JOIN",
+            CommandType::UNKNOWN(x) => x,
+        }
+        .to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Side {
+    Server,
+    Client,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Command {
-    tags: Vec<Tag>,
-    source: Option<Source>,
-    command: CommandType,
-    parameters: Vec<Parameter>,
+    pub tags: Vec<Tag>,
+    pub source: Option<Source>,
+    pub command: CommandType,
+    pub parameters: Vec<Parameter>,
+    // Metadata
+    pub side: Side,
+}
+
+impl ToString for Command {
+    fn to_string(&self) -> String {
+        let mut str = String::new();
+        if !self.tags.is_empty() {
+            str.push_str(&self.tags.join(" "));
+            str.push(' ');
+        }
+        if let Some(x) = &self.source {
+            str.push_str(x);
+            str.push(' ');
+        }
+        str.push_str(&self.command.to_string());
+        str.push(' ');
+
+        str.push_str(&self.parameters.join(" "));
+
+        str.push_str("\r\n");
+        str
+    }
 }
 
 #[derive(Debug)]
 pub enum Code {
     Fine,
+    Broadcast,
     Exit,
 }
 
 impl Command {
-    pub fn parse<S: AsRef<str>>(frame: S) -> Result<Self> {
+    pub fn parse<S: AsRef<str>>(frame: S, side: Side) -> Result<Self> {
         let str = frame.as_ref();
         let parts = str
             .split(' ')
@@ -72,7 +122,7 @@ impl Command {
         let mut parameters = Vec::new();
         for (i, x) in parameters_no_trailer.iter().enumerate() {
             if x.starts_with(':') {
-                parameters.push(parameters_no_trailer[i..].join(" "));
+                parameters.push(parameters_no_trailer[i..].join(" ").trim().to_string());
                 break;
             }
             parameters.push(x.trim().to_string());
@@ -83,6 +133,7 @@ impl Command {
             source,
             command,
             parameters,
+            side,
         })
     }
 
@@ -103,7 +154,11 @@ impl Command {
                 cc.connection.write_registration(&cc.info).await?;
             }
             CommandType::PING => {
-                cc.connection.write_pong().await?;
+                println!(
+                    "[{}] PING detected, writing PONG.",
+                    cc.connection.client_addr.ip(),
+                );
+                cc.connection.write_pong(&self.parameters[0]).await?;
             }
             CommandType::MOTD => {
                 cc.connection.write_motd(&cc.info).await?;
@@ -112,6 +167,27 @@ impl Command {
                 cc.connection.write_error("Goodbye!").await?;
                 return Ok(Code::Exit);
             }
+            CommandType::PRIVMSG => match self.side {
+                Side::Client => return Ok(Code::Broadcast),
+                // Safety: self.to_string() always ends with \r\n.
+                Side::Server => unsafe {
+                    let str = self.to_string();
+                    println!("PRIVMSG broadcast, writing: {:?}", str);
+                    cc.connection.write_raw(str).await?;
+                },
+            },
+            CommandType::JOIN => match self.side {
+                Side::Client => {
+                    cc.info.channels.push(self.parameters[0].clone());
+                    return Ok(Code::Broadcast);
+                }
+                Side::Server => {
+                    // Safety: self.to_string() always ends with \r\n.
+                    unsafe {
+                        cc.connection.write_raw(self.to_string()).await?;
+                    }
+                }
+            },
             CommandType::UNKNOWN(attempt) => {
                 cc.connection.write_unknown(&cc.info, attempt).await?;
             }
