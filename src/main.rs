@@ -1,7 +1,14 @@
-use std::io::{prelude::*, BufReader};
-use std::net::{Shutdown, TcpListener, TcpStream};
-use std::ops::{Deref, DerefMut};
+// use std::io::{prelude::*, BufReader};
+// use std::net::{Shutdown, TcpListener, TcpStream};
+use std::io::Result;
+use std::net::SocketAddr;
 use std::process::exit;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::OwnedWriteHalf;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch::{self, Receiver, Sender};
 
 /// Holds information about a client for a given connection.
 #[derive(Debug, Default)]
@@ -30,6 +37,7 @@ enum NumericReply {
     RPL_MOTDSTART = 375,
     RPL_MOTD = 372,
     RPL_ENDOFMOTD = 376,
+    ERR_UNKNOWN_COMMAND = 421,
 }
 
 impl ToString for NumericReply {
@@ -39,250 +47,288 @@ impl ToString for NumericReply {
 }
 
 /// Wrapper around TcpStream that handles common write operations for IRC traffic.
-struct IrcWriter(TcpStream);
+#[allow(dead_code)]
+struct IrcWriter {
+    stream: OwnedWriteHalf,
+    server_addr: SocketAddr,
+    client_addr: SocketAddr,
+}
 
 impl IrcWriter {
     /// Make a new IrcWriter for `stream`.
-    fn new(stream: TcpStream) -> Self {
-        Self(stream)
+    fn new(stream: OwnedWriteHalf, server_addr: SocketAddr, client_addr: SocketAddr) -> Self {
+        Self {
+            stream,
+            server_addr,
+            client_addr,
+        }
     }
 
     /// Sends the numeric reply sequence for the MOTD.
-    fn motd(&mut self, client: &ClientInfo) -> std::io::Result<()> {
+    async fn motd(&mut self, client: &ClientInfo) -> Result<()> {
         self.numeric_reply(
             client,
             NumericReply::RPL_MOTDSTART,
-            format!("- {} Message of the day - ", self.0.local_addr()?.ip()),
-        )?;
-        self.numeric_reply(client, NumericReply::RPL_MOTD, "- Hi from Rust-IRC!")?;
-        self.numeric_reply(client, NumericReply::RPL_ENDOFMOTD, "End of /MOTD command")?;
+            format!("- {} Message of the day - ", self.server_addr.ip()),
+        )
+        .await?;
+        self.numeric_reply(client, NumericReply::RPL_MOTD, "- Hi from Rust-IRC!")
+            .await?;
+        self.numeric_reply(client, NumericReply::RPL_ENDOFMOTD, "End of /MOTD command")
+            .await?;
         Ok(())
     }
 
     /// This is the 5 packet series required after a registration has finished.
-    fn registration_reply(&mut self, client: &ClientInfo) -> std::io::Result<()> {
+    async fn registration_reply(&mut self, client: &ClientInfo) -> Result<()> {
         self.numeric_reply(
             client,
             NumericReply::RPL_WELCOME,
             format!(
                 "Welcome to the Internet Relay Network {}",
-                client.to_canonical(self.0.local_addr()?.ip().to_string())
+                client.to_canonical(self.server_addr.ip().to_string())
             ),
-        )?;
+        )
+        .await?;
         self.numeric_reply(
             client,
             NumericReply::RPL_YOURHOST,
             format!(
                 "Your host is {}, running version rust_irc-0.0.0",
-                self.0.local_addr()?.ip()
+                self.server_addr.ip()
             ),
-        )?;
+        )
+        .await?;
         self.numeric_reply(
             client,
             NumericReply::RPL_CREATED,
             "This server was created... probably 10 seconds ago who cares",
-        )?;
+        )
+        .await?;
         self.numeric_reply_notrailer(
             client,
             NumericReply::RPL_MYINFO,
             format!(
                 "{} {} {} {}",
-                self.0.local_addr()?.ip(),
+                self.server_addr.ip(),
                 "rust_irc-0.0.0",
                 " ",
                 " "
             ),
-        )?;
+        )
+        .await?;
         self.numeric_reply_notrailer(
             client,
             NumericReply::RPL_ISUPPORT,
             "CASEMAPPING=ascii :are available on this server",
-        )?;
+        )
+        .await?;
         Ok(())
     }
 
     /// Common numeric reply.
-    fn numeric_reply<S: AsRef<str>>(
+    async fn numeric_reply<S: AsRef<str>>(
         &mut self,
         client: &ClientInfo,
         number: NumericReply,
         message: S,
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         // :<source> <number> <client> :<message>
-        write!(
-            self.0,
-            ":{} {} {} :{}\r\n",
-            self.0.local_addr()?.ip(),
-            number.to_string(),
-            client.username,
-            message.as_ref()
-        )
+        self.stream
+            .write_all(
+                format!(
+                    ":{} {} {} :{}\r\n",
+                    self.server_addr.ip(),
+                    number.to_string(),
+                    client.username,
+                    message.as_ref()
+                )
+                .as_bytes(),
+            )
+            .await
     }
 
     /// Numeric reply without the trailer marker.
-    fn numeric_reply_notrailer<S: AsRef<str>>(
+    async fn numeric_reply_notrailer<S: AsRef<str>>(
         &mut self,
         client: &ClientInfo,
         number: NumericReply,
         message: S,
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         // :<source> <number> <client> <message>
-        write!(
-            self.0,
-            ":{} {} {} {}\r\n",
-            self.0.local_addr()?.ip(),
-            number.to_string(),
-            client.username,
-            message.as_ref()
-        )
+        self.stream
+            .write_all(
+                format!(
+                    ":{} {} {} {}\r\n",
+                    self.server_addr.ip(),
+                    number.to_string(),
+                    client.username,
+                    message.as_ref()
+                )
+                .as_bytes(),
+            )
+            .await
     }
 
     /// Sends a notice to the client.
     #[allow(dead_code)]
-    fn notice<S: AsRef<str>>(&mut self, client: &ClientInfo, message: S) -> std::io::Result<()> {
-        write!(
-            self.0,
-            "NOTICE {} :{}\r\n",
-            client.username,
-            message.as_ref()
-        )
+    async fn notice<S: AsRef<str>>(&mut self, client: &ClientInfo, message: S) -> Result<()> {
+        self.stream
+            .write_all(format!("NOTICE {} :{}\r\n", client.username, message.as_ref()).as_bytes())
+            .await?;
+        Ok(())
     }
 
     /// Sends the PONG command.
-    fn pong(&mut self) -> std::io::Result<()> {
-        write!(self.0, "PONG {}\r\n", self.0.local_addr()?.ip())
+    async fn pong(&mut self) -> Result<()> {
+        self.stream
+            .write_all(format!("PONG {}\r\n", self.server_addr.ip()).as_bytes())
+            .await?;
+        Ok(())
     }
 
     /// Sends an ERROR command with a custom message.
-    fn error<S: AsRef<str>>(&mut self, message: S) -> std::io::Result<()> {
-        write!(self.0, "ERROR :{}", message.as_ref())
+    async fn error<S: AsRef<str>>(&mut self, message: S) -> Result<()> {
+        self.stream
+            .write_all(format!("ERROR :{}", message.as_ref()).as_bytes())
+            .await?;
+        Ok(())
     }
-}
 
-struct ClientStreamWrapper(TcpStream);
-
-impl Drop for ClientStreamWrapper {
-    fn drop(&mut self) {
-        let mut writer = IrcWriter::new(self.0.try_clone().expect("Failed to clean up stream."));
-        writer.error("Server shutting down.").unwrap();
-    }
-}
-
-impl Deref for ClientStreamWrapper {
-    type Target = TcpStream;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for ClientStreamWrapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+    /// Sends a KILL command.
+    async fn quit(&mut self, client: &ClientInfo) -> Result<()> {
+        self.stream
+            .write_all(
+                format!(":{} QUIT :Quit: Server shutting down\r\n", client.username).as_bytes(),
+            )
+            .await?;
+        Ok(())
     }
 }
 
 /// Threaded client loop
-fn handle_client(stream: TcpStream) -> std::io::Result<()> {
+async fn handle_client(stream: TcpStream, mut rx: Receiver<()>) -> Result<()> {
     // In-memory database :^)
     let mut client_info = ClientInfo::default();
 
-    let mut stream = ClientStreamWrapper(stream);
-
     let client_addr = stream.peer_addr().expect("Client had no address.");
+    let server_addr = stream.local_addr().expect("Server had no address.");
     println!("New connection from {:?}", client_addr);
 
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .expect("Failed to separate reader from stream."),
-    );
+    let (read, write) = stream.into_split();
 
-    let mut writer = IrcWriter::new(
-        stream
-            .try_clone()
-            .expect("Failed to separate writer from stream."),
-    );
+    let mut reader = BufReader::new(read);
+    let mut writer = IrcWriter::new(write, server_addr, client_addr);
 
     let mut buf = String::new();
     loop {
-        match reader.read_line(&mut buf) {
-            Ok(u) => {
-                if u == 0 {
-                    println!(
-                        "Client {:?} gracefully closed connection with EOF.",
-                        client_addr
-                    );
-                    return Ok(());
-                }
-                let parts: Vec<&str> = buf.split_ascii_whitespace().collect();
+        tokio::select! {
+            _ = rx.changed() => {
+                // Exit immediately
+                writer.quit(&client_info).await?;
+                writer.error("Server shutting down!").await?;
+                return Ok(())
+            }
+            r = reader.read_line(&mut buf) => {
+                match r {
+                    Ok(u) => {
+                        if u == 0 {
+                            println!(
+                                "Client {:?} gracefully closed connection with EOF.",
+                                client_addr
+                            );
+                            return Ok(());
+                        }
+                        let parts: Vec<&str> = buf.split_ascii_whitespace().collect();
 
-                let command = parts[0].to_uppercase();
+                        let command = parts[0].to_uppercase();
 
-                match command.as_str() {
-                    "NICK" => {
-                        client_info.nickname = parts[1].to_string();
-                        println!("Received nickname: {:?}", client_info);
+                        match command.as_str() {
+                            "NICK" => {
+                                client_info.nickname = parts[1].to_string();
+                                println!("Received nickname: {:?}", client_info);
+                            }
+                            "USER" => {
+                                client_info.username = parts[1].to_string();
+                                client_info.realname = buf
+                                    .split(':')
+                                    .last()
+                                    .expect("No real name provided")
+                                    .to_string();
+                                println!("Received user registration: {:?}", client_info);
+                                writer.registration_reply(&client_info).await?;
+                            }
+                            "PING" => {
+                                println!("Received ping, sending pong.");
+                                writer.pong().await?;
+                            }
+                            "MOTD" => {
+                                println!("{} wants a MOTD!!!!!", client_addr);
+                                writer.motd(&client_info).await?;
+                            }
+                            "QUIT" => {
+                                println!("Client said goodbye! {}", client_addr);
+                                writer.error("Goodbye!").await?;
+                                return Ok(());
+                            }
+                            "MODE" => {
+                                println!("Ignoring MODE.");
+                            }
+                            _ => {
+                                println!("Recieved unknown command: {:?}", parts);
+                                writer
+                                    .numeric_reply_notrailer(
+                                        &client_info,
+                                        NumericReply::ERR_UNKNOWN_COMMAND,
+                                        format!("* {}: Unknown Command", parts[0]),
+                                    )
+                                    .await?;
+                            }
+                        };
                     }
-                    "USER" => {
-                        client_info.username = parts[1].to_string();
-                        client_info.realname = buf
-                            .split(':')
-                            .last()
-                            .expect("No real name provided")
-                            .to_string();
-                        println!("Received user registration: {:?}", client_info);
-                        writer.registration_reply(&client_info)?;
-                    }
-                    "PING" => {
-                        println!("Received ping, sending pong.");
-                        writer.pong()?;
-                    }
-                    "MOTD" => {
-                        println!("{} wants a MOTD!!!!!", client_addr);
-                        writer.motd(&client_info)?;
-                    }
-                    "QUIT" => {
-                        println!("Client said goodbye! {}", client_addr);
-                        writer.error("Goodbye!")?;
-                        stream.shutdown(Shutdown::Both)?;
+                    Err(e) => {
+                        println!("Client disconnected badly, encountered IO error {}", e);
                         return Ok(());
                     }
-                    "MODE" => {
-                        println!("Ignoring MODE.");
-                    }
-                    _ => {
-                        println!("Recieved unknown command: {:?}", parts);
-                        stream.write_fmt(format_args!(
-                            ":{} 421 * {}: Unknown command\r\n",
-                            client_addr, parts[0]
-                        ))?;
-                    }
-                };
-            }
-            Err(e) => {
-                println!("Client disconnected badly, encountered IO error {}", e);
-                stream.shutdown(Shutdown::Both)?;
-                return Ok(());
+                }
             }
         }
+
         buf.clear();
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("0.0.0.0:6667")?;
+#[tokio::main]
+async fn main() -> Result<()> {
+    let listener = TcpListener::bind("0.0.0.0:6667").await?;
 
     println!("Listening on {:?}", listener.local_addr());
-    for stream in listener.incoming() {
-        std::thread::spawn(move || handle_client(stream?));
-    }
 
-    ctrlc::set_handler(|| {
-        println!("Ctrl-C received, exiting.");
+    let killers: Arc<Mutex<Vec<Sender<()>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let thread_killers = Arc::clone(&killers);
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to listen for ctrl-c");
+        // This may or may not ever happen
+        println!("Ctrl-C received, terminating");
+        for tx in thread_killers.lock().unwrap().iter() {
+            tx.send(()).unwrap();
+        }
+        // Wait 100ms and assume that all clients have been killed
+        // This should actually wait for client handling threads to reply that they have sent the messages
+        // but I can't figure out the lifetimes so fuck it
+        tokio::time::sleep(Duration::from_millis(100)).await;
         exit(0);
-    })
-    .expect("Error setting Ctrl-C handler.");
+    });
 
-    Ok(())
+    loop {
+        let (stream, _) = listener.accept().await?;
+
+        let (tx, rx) = watch::channel(());
+        killers.lock().unwrap().push(tx);
+
+        tokio::spawn(handle_client(stream, rx));
+    }
 }
