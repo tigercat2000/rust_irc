@@ -179,6 +179,11 @@ impl Command {
             CommandType::JOIN => match self.side {
                 Side::Client => {
                     cc.info.channels.push(self.parameters[0].clone());
+                    // We have to parrot the client's JOIN back to them.
+                    // Safety: self.to_string() always ends with \r\n
+                    unsafe {
+                        cc.connection.write_raw(self.to_string()).await?;
+                    }
                     return Ok(Code::Broadcast);
                 }
                 Side::Server => {
