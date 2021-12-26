@@ -1,8 +1,9 @@
 use std::future::Future;
 
 use crate::{
-    command::{Code, CommandType, Side},
-    Command, IrcConnection, Result, Shutdown,
+    message_impl::Code,
+    message_parse::{Command, Message, Side},
+    IrcConnection, Result, Shutdown,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -11,8 +12,13 @@ use tokio::{
 
 #[derive(Debug, Clone)]
 enum ServerClientBroadcast {
-    PrivMessage { channel: String, command: Command },
-    Join { command: Command },
+    PrivMessage {
+        channels: Vec<String>,
+        message: Message,
+    },
+    Join {
+        message: Message,
+    },
 }
 
 /// Starts the IRC Server and waits for it to complete.
@@ -64,8 +70,8 @@ struct Server {
     listener: TcpListener,
     client_tx: broadcast::Sender<ServerClientBroadcast>,
     // Server messages
-    server_tx: mpsc::Sender<Command>,
-    server_rx: mpsc::Receiver<Command>,
+    server_tx: mpsc::Sender<Message>,
+    server_rx: mpsc::Receiver<Message>,
     // Graceful shutdown
     notify_shutdown: broadcast::Sender<()>,
     shutdown_complete_rx: mpsc::Receiver<()>,
@@ -113,17 +119,17 @@ impl Server {
         Ok(())
     }
 
-    async fn send_broadcast(&mut self, broadcast: Command) -> Result<()> {
-        match broadcast.command {
-            CommandType::PRIVMSG => {
+    async fn send_broadcast(&mut self, broadcast: Message) -> Result<()> {
+        match &broadcast.command {
+            Command::PRIVMSG(targets, _) => {
                 self.client_tx.send(ServerClientBroadcast::PrivMessage {
-                    channel: broadcast.parameters[0].clone(),
-                    command: broadcast,
+                    channels: targets.clone(),
+                    message: broadcast,
                 })?;
             }
-            CommandType::JOIN => {
+            Command::JOIN(_, _) => {
                 self.client_tx
-                    .send(ServerClientBroadcast::Join { command: broadcast })?;
+                    .send(ServerClientBroadcast::Join { message: broadcast })?;
             }
             _ => {}
         }
@@ -153,7 +159,7 @@ pub struct ClientConnection {
     pub connection: IrcConnection,
     pub info: ClientInfo,
     // Sending messages upstream
-    server_tx: mpsc::Sender<Command>,
+    server_tx: mpsc::Sender<Message>,
     client_rx: broadcast::Receiver<ServerClientBroadcast>,
     // Graceful shutdown
     shutdown: Shutdown,
@@ -171,23 +177,26 @@ impl ClientConnection {
                         self.quit_client().await?;
                         return Ok(());
                     }
-                    Some(Command::parse(res.unwrap(), Side::Client)?)
+                    let mut message: Message = res.unwrap().parse()?;
+                    message.side = Side::Client;
+                    Some(message)
                 },
                 res = self.client_rx.recv() => {
-                    println!("RECEIVED CLIENT_RX!!! {:?}", res);
-
                     let command = res?;
                     match command {
-                        ServerClientBroadcast::PrivMessage { channel, command } => {
-                            let source = command.source.as_ref().unwrap();
-                            if self.info.channels.contains(&channel) && source[1..] != self.info.username {
-                                Some(command)
+                        ServerClientBroadcast::PrivMessage { channels, message } => {
+                            if let Some(source) = &message.source {
+                                if source != &self.info.username && self.info.channels.iter().any(|a| channels.contains(a)) {
+                                    Some(message.clone())
+                                } else {
+                                    None
+                                }
                             } else {
                                 None
                             }
                         }
-                        ServerClientBroadcast::Join { command } => {
-                            Some(command)
+                        ServerClientBroadcast::Join { message } => {
+                            Some(message)
                         }
                     }
                 },
@@ -204,14 +213,14 @@ impl ClientConnection {
                 }
             };
 
-            // let mut command = Command::parse(frame, side)?;
-            println!("Command: {:?}", command);
+            // let mut command = Message::parse(frame, side)?;
+            // println!("Message: {:?}", command);
 
             match command.apply(self).await {
                 Ok(Code::Fine) => {}
                 Ok(Code::Broadcast) => {
                     // If we're rebroadcasting, we have to set the source to our username.
-                    command.source = Some(format!(":{}", self.info.username));
+                    command.source = Some(self.info.username.clone());
                     command.side = Side::Server;
                     self.server_tx.send(command).await?;
                 }

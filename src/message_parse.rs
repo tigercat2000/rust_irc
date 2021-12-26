@@ -54,7 +54,7 @@ fn strip_colon(mut a: String) -> std::result::Result<String, std::io::Error> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 // It's a protocol spec, we follow it
 #[allow(clippy::upper_case_acronyms)]
 pub enum Command {
@@ -131,7 +131,7 @@ impl FromStr for Command {
         // This can never be empty, be s.split() will always return at least one element.
         let parts: Vec<&str> = s.split(' ').collect();
 
-        Ok(match parts[0].to_uppercase().as_str() {
+        let message = match parts[0].to_uppercase().as_str() {
             "DIE" => Self::DIE,
             "JOIN" => {
                 // Need at least one channel.
@@ -153,7 +153,7 @@ impl FromStr for Command {
             }
             "MOTD" => {
                 if parts.len() != 1 {
-                    Self::UNIMPLEMENTED(s.to_string())
+                    Self::UNIMPLEMENTED(s.trim().to_string())
                 } else {
                     Self::MOTD(None)
                 }
@@ -218,14 +218,16 @@ impl FromStr for Command {
                     "Blank input",
                 ));
             }
-            _ => Self::UNKNOWN(s.to_string()),
-        })
+            _ => Self::UNKNOWN(s.trim().to_string()),
+        };
+        eprintln!("Message parsed: {:?}", message);
+        Ok(message)
     }
 }
 
 impl ToString for Command {
     fn to_string(&self) -> String {
-        match self {
+        let str = match self {
             Command::ADMIN(_) => todo!(),
             Command::AWAY(_) => todo!(),
             Command::CONNECT(_, _, _) => todo!(),
@@ -291,15 +293,25 @@ impl ToString for Command {
             Command::WHOIS(_, _) => todo!(),
             Command::UNKNOWN(s) => s.clone(),
             Command::UNIMPLEMENTED(s) => s.clone(),
-        }
+        };
+        eprintln!("Message stringified: {:?}", str);
+        str
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Side {
+    Client,
+    Server,
+    Unknown,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Message {
-    tags: Option<Vec<String>>,
-    source: Option<String>,
-    command: Command,
+    pub(crate) tags: Option<Vec<String>>,
+    pub(crate) source: Option<String>,
+    pub(crate) command: Command,
+    pub(crate) side: Side,
 }
 
 impl FromStr for Message {
@@ -310,6 +322,7 @@ impl FromStr for Message {
             tags: None,
             source: None,
             command: Command::UNKNOWN("".to_string()),
+            side: Side::Unknown,
         };
 
         let mut rest = "".to_string();
@@ -370,6 +383,22 @@ impl FromStr for Message {
 
         new_self.command = Command::from_str(&rest)?;
         Ok(new_self)
+    }
+}
+
+impl ToString for Message {
+    fn to_string(&self) -> String {
+        match (&self.tags, &self.source) {
+            (None, None) => self.command.to_string(),
+            (None, Some(source)) => format!(":{} {}", source, self.command.to_string()),
+            (Some(tags), None) => format!("@{} {}", tags.join(";"), self.command.to_string()),
+            (Some(tags), Some(source)) => format!(
+                "@{} :{} {}",
+                tags.join(";"),
+                source,
+                self.command.to_string()
+            ),
+        }
     }
 }
 
@@ -541,7 +570,8 @@ mod test {
             Message {
                 tags: Some(vec!["meow".to_string(), "mlem".to_string()]),
                 source: Some("irc.example.com".to_string()),
-                command: Command::UNKNOWN("CAP LS * :multi-prefix extended-join sasl".to_string())
+                command: Command::UNKNOWN("CAP LS * :multi-prefix extended-join sasl".to_string()),
+                side: Side::Unknown,
             }
         )
     }
@@ -561,7 +591,8 @@ mod test {
                     "0".to_string(),
                     "*".to_string(),
                     "Meow Tompski".to_string()
-                )
+                ),
+                side: Side::Unknown,
             }
         )
     }

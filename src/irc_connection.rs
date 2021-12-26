@@ -83,16 +83,6 @@ impl IrcConnection {
             username,
             message.as_ref()
         );
-        println!(
-            "Writing {:?}",
-            format!(
-                ":{} {} {} {}\r\n",
-                self.server_addr.ip(),
-                number.to_string(),
-                username,
-                message.as_ref()
-            )
-        );
         Ok(())
     }
 
@@ -130,7 +120,6 @@ impl IrcConnection {
     }
 
     pub async fn write_registration(&mut self, client: &ClientInfo) -> Result<()> {
-        println!("Writing registration");
         self.write_numeric_trailer(
             client,
             NumericReply::RPL_WELCOME,
@@ -191,10 +180,6 @@ impl IrcConnection {
     }
 
     pub async fn write_pong<S: AsRef<str>>(&mut self, discrimator: S) -> Result<()> {
-        println!(
-            "Writing: {:?}",
-            format!("PONG {} {}", self.server_addr.ip(), discrimator.as_ref())
-        );
         format_write!(
             self.stream,
             "PONG {} {}",

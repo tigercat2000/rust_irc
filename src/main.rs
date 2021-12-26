@@ -1,8 +1,6 @@
-mod command_new;
-
-mod command;
-use command::Command;
 mod irc_connection;
+mod message_impl;
+mod message_parse;
 use irc_connection::IrcConnection;
 mod server;
 use server::{ClientConnection, ClientInfo};
