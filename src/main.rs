@@ -1,3 +1,5 @@
+mod command_new;
+
 mod command;
 use command::Command;
 mod irc_connection;
