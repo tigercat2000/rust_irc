@@ -56,7 +56,7 @@ fn strip_colon(mut a: String) -> std::result::Result<String, std::io::Error> {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 // It's a protocol spec, we follow it
-#[allow(clippy::upper_case_acronyms)]
+#[allow(clippy::upper_case_acronyms, dead_code)]
 pub enum Command {
     ADMIN(Option<Target>),
     AWAY(Option<Msg>),
