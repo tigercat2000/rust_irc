@@ -1,25 +1,13 @@
-use std::future::Future;
-
 use crate::{
     message_impl::Code,
     message_parse::{Command, Message, Side},
     IrcConnection, Result, Shutdown,
 };
+use std::future::Future;
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::*,
 };
-
-#[derive(Debug, Clone)]
-enum ServerClientBroadcast {
-    PrivMessage {
-        channels: Vec<String>,
-        message: Message,
-    },
-    Join {
-        message: Message,
-    },
-}
 
 /// Starts the IRC Server and waits for it to complete.
 /// `shutdown` allows you to pass in a future that will allow early termination with clean shutdowns for each connection
@@ -65,17 +53,33 @@ pub async fn run(listener: TcpListener, shutdown: impl Future) {
     let _ = shutdown_complete_rx.recv().await;
 }
 
+#[derive(Debug, Clone)]
+enum ServerToClientPacket {
+    PrivMessage {
+        channels: Vec<String>,
+        message: Message,
+    },
+    Join {
+        message: Message,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum ClientToServerPacket {
+    BlindBroadcast(Message),
+}
+
 #[derive(Debug)]
 struct Server {
     /// This is the TcpListener which new clients connect to, forming a TcpStream that is then tokio-spawned off
     listener: TcpListener,
     /// This is how we tell clients that we
-    client_tx: broadcast::Sender<ServerClientBroadcast>,
+    client_tx: broadcast::Sender<ServerToClientPacket>,
     // Server messages
     /// We don't use this, but we need to hold it somewhere in memory and this struct is convenient
-    server_tx: mpsc::Sender<Message>,
+    server_tx: mpsc::Sender<ClientToServerPacket>,
     /// This is what we actually use, clients send message on tx and we get it on rx
-    server_rx: mpsc::Receiver<Message>,
+    server_rx: mpsc::Receiver<ClientToServerPacket>,
     // Graceful shutdown
     /// This broadcasts a shutdown signal to all active connections
     notify_shutdown: broadcast::Sender<()>,
@@ -95,9 +99,9 @@ impl Server {
                     self.accept_client(socket?.0).await?;
                 }
                 // Established client asking us for something
-                broadcast = self.server_rx.recv() => {
-                    if let Some(x) = broadcast {
-                        self.send_broadcast(x).await?;
+                client_message = self.server_rx.recv() => {
+                    if let Some(x) = client_message {
+                        self.handle_client_packet(x).await?;
                     } else {
                         // Something has gone critically wrong to get to this point
                         return Err(Box::new(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "server_tx broke")));
@@ -140,22 +144,23 @@ impl Server {
     }
 
     /// This handles all messages that the client threads ask the server to do
-    async fn send_broadcast(&mut self, broadcast: Message) -> Result<()> {
-        match &broadcast.command {
-            Command::PRIVMSG(targets, _) => {
-                self.client_tx.send(ServerClientBroadcast::PrivMessage {
-                    channels: targets.clone(),
-                    message: broadcast,
-                })?;
-            }
-            Command::JOIN(_, _) => {
-                self.client_tx
-                    .send(ServerClientBroadcast::Join { message: broadcast })?;
-            }
-            _ => {}
+    async fn handle_client_packet(&mut self, packet: ClientToServerPacket) -> Result<()> {
+        match packet {
+            ClientToServerPacket::BlindBroadcast(broadcast) => match &broadcast.command {
+                Command::PRIVMSG(targets, _) => {
+                    self.client_tx.send(ServerToClientPacket::PrivMessage {
+                        channels: targets.clone(),
+                        message: broadcast,
+                    })?;
+                }
+                Command::JOIN(_, _) => {
+                    self.client_tx
+                        .send(ServerToClientPacket::Join { message: broadcast })?;
+                }
+                _ => {}
+            },
         }
 
-        // self.client_tx.send(broadcast)?;
         Ok(())
     }
 }
@@ -182,9 +187,9 @@ pub struct ClientConnection {
     /// Information about the connection that we need stored somewhere
     pub info: ClientInfo,
     /// We use this to ask the server to do stuff
-    server_tx: mpsc::Sender<Message>,
+    server_tx: mpsc::Sender<ClientToServerPacket>,
     /// We receive on this to do stuff when the server asks us to
-    client_rx: broadcast::Receiver<ServerClientBroadcast>,
+    client_rx: broadcast::Receiver<ServerToClientPacket>,
     /// We run this helper and wait until it tells us to die
     shutdown: Shutdown,
     /// When we Drop this Drops and the server can tell we're dead
@@ -215,7 +220,7 @@ impl ClientConnection {
                 res = self.client_rx.recv() => {
                     let command = res?;
                     match command {
-                        ServerClientBroadcast::PrivMessage { channels, message } => {
+                        ServerToClientPacket::PrivMessage { channels, message } => {
                             if let Some(source) = &message.source {
                                 if source != &self.info.username && self.info.channels.iter().any(|a| channels.contains(a)) {
                                     Some(message.clone())
@@ -226,7 +231,7 @@ impl ClientConnection {
                                 None
                             }
                         }
-                        ServerClientBroadcast::Join { message } => {
+                        ServerToClientPacket::Join { message } => {
                             Some(message)
                         }
                     }
@@ -259,7 +264,9 @@ impl ClientConnection {
                     // If we're rebroadcasting, we have to set the source to our username.
                     command.source = Some(self.info.username.clone());
                     command.side = Side::Server;
-                    self.server_tx.send(command).await?;
+                    self.server_tx
+                        .send(ClientToServerPacket::BlindBroadcast(command))
+                        .await?;
                 }
                 // It did something and we're dying now
                 Ok(Code::Exit) => return Ok(()),
