@@ -132,25 +132,7 @@ impl FromStr for Command {
         let parts: Vec<&str> = s.split(' ').collect();
 
         Ok(match parts[0].to_uppercase().as_str() {
-            "USER" => {
-                minlength_or_fail(&parts, 5)?;
-                let realname = strip_colon(parts[4..].join(" "))?;
-                Self::USER(
-                    parts[1].to_string(),
-                    parts[2].to_string(),
-                    parts[3].to_string(),
-                    realname,
-                )
-            }
-            "QUIT" => {
-                let mut message = None;
-                if let Some(pieces) = parts.get(1..) {
-                    if !pieces.is_empty() && !pieces[0].is_empty() {
-                        message = Some(strip_colon(pieces.join(" "))?);
-                    }
-                }
-                Self::QUIT(message)
-            }
+            "DIE" => Self::DIE,
             "JOIN" => {
                 // Need at least one channel.
                 minlength_or_fail(&parts, 2)?;
@@ -181,6 +163,14 @@ impl FromStr for Command {
                 // Spaces aren't allowed.
                 Self::NICK(parts[1].to_string())
             }
+            "PING" => {
+                minlength_or_fail(&parts, 2)?;
+                Self::PING(parts[1].to_string())
+            }
+            "PONG" => {
+                minlength_or_fail(&parts, 3)?;
+                Self::PONG(parts[1].to_string(), parts[2].to_string())
+            }
             "PRIVMSG" => {
                 minlength_or_fail(&parts, 3)?;
                 // The first parameter is comma separated targets
@@ -201,16 +191,26 @@ impl FromStr for Command {
                     message,
                 )
             }
-            "PING" => {
-                minlength_or_fail(&parts, 2)?;
-                Self::PING(parts[1].to_string())
+            "QUIT" => {
+                let mut message = None;
+                if let Some(pieces) = parts.get(1..) {
+                    if !pieces.is_empty() && !pieces[0].is_empty() {
+                        message = Some(strip_colon(pieces.join(" "))?);
+                    }
+                }
+                Self::QUIT(message)
             }
-            "PONG" => {
-                minlength_or_fail(&parts, 3)?;
-                Self::PONG(parts[1].to_string(), parts[2].to_string())
-            }
-            "DIE" => Self::DIE,
             "REHASH" => Self::REHASH,
+            "USER" => {
+                minlength_or_fail(&parts, 5)?;
+                let realname = strip_colon(parts[4..].join(" "))?;
+                Self::USER(
+                    parts[1].to_string(),
+                    parts[2].to_string(),
+                    parts[3].to_string(),
+                    realname,
+                )
+            }
             // Yep, split() can do this to us.
             "" => {
                 return Err(std::io::Error::new(
@@ -220,6 +220,78 @@ impl FromStr for Command {
             }
             _ => Self::UNKNOWN(s.to_string()),
         })
+    }
+}
+
+impl ToString for Command {
+    fn to_string(&self) -> String {
+        match self {
+            Command::ADMIN(_) => todo!(),
+            Command::AWAY(_) => todo!(),
+            Command::CONNECT(_, _, _) => todo!(),
+            Command::DIE => "DIE".to_string(),
+            Command::ENCAP(_, _, _) => todo!(),
+            Command::ERROR(_) => todo!(),
+            Command::HELP => todo!(),
+            Command::INFO(_) => todo!(),
+            Command::INVITE(_, _) => todo!(),
+            Command::JOIN(chans, maybe_keys) => {
+                if let Some(keys) = maybe_keys {
+                    format!("JOIN {} {}", chans.join(","), keys.join(","))
+                } else {
+                    format!("JOIN {}", chans.join(","))
+                }
+            }
+            Command::KICK(_, _, _) => todo!(),
+            Command::KILL(_, _) => todo!(),
+            Command::KNOCK(_, _) => todo!(),
+            Command::LINKS(_, _) => todo!(),
+            Command::LIST(_, _) => todo!(),
+            Command::LUSERS(_, _) => todo!(),
+            Command::MODE(_, _, _) => todo!(),
+            Command::MOTD(x) if x.is_some() => todo!(),
+            Command::MOTD(_) => "MOTD".to_string(),
+            Command::NAMES(_) => todo!(),
+            Command::NICK(nickname) => format!("NICK {}", nickname),
+            Command::NOTICE(_, _) => todo!(),
+            Command::OPER(_, _) => todo!(),
+            Command::PART(_, _) => todo!(),
+            Command::PASS(_) => todo!(),
+            Command::PING(token) => format!("PING {}", token),
+            Command::PONG(server, token) => format!("PONG {} {}", server, token),
+            Command::PRIVMSG(targets, message) => {
+                format!("PRIVMSG {} :{}", targets.join(","), message)
+            }
+            Command::QUIT(maybe_reason) => {
+                if let Some(reason) = maybe_reason {
+                    format!("QUIT :{}", reason)
+                } else {
+                    "QUIT".to_string()
+                }
+            }
+            Command::REHASH => "REHASH".to_string(),
+            Command::SQUIT(_, _) => todo!(),
+            Command::STATS(_, _) => todo!(),
+            Command::TIME(_) => todo!(),
+            Command::TOPIC(_, _) => todo!(),
+            Command::TRACE(_) => todo!(),
+            Command::USER(username, mode, un, real) => {
+                if real.contains(' ') {
+                    format!("USER {} {} {} :{}", username, mode, un, real)
+                } else {
+                    format!("USER {} {} {} {}", username, mode, un, real)
+                }
+            }
+            Command::USERHOST(_) => todo!(),
+            Command::USERIP(_) => todo!(),
+            Command::USERS(_) => todo!(),
+            Command::VERSION(_) => todo!(),
+            Command::WALLOPS(_) => todo!(),
+            Command::WHO(_) => todo!(),
+            Command::WHOIS(_, _) => todo!(),
+            Command::UNKNOWN(s) => s.clone(),
+            Command::UNIMPLEMENTED(s) => s.clone(),
+        }
     }
 }
 
@@ -492,5 +564,24 @@ mod test {
                 )
             }
         )
+    }
+
+    #[test]
+    fn test_to_string_matches_from_string() {
+        let mut str = "PRIVMSG #meow :hey dudes";
+        let mut command: Command = str.parse().unwrap();
+        assert_eq!(command.to_string(), str);
+
+        str = "USER guest 0 * :Meow Tompski";
+        command = str.parse().unwrap();
+        assert_eq!(command.to_string(), str);
+
+        str = "USER guest 0 * meow";
+        command = str.parse().unwrap();
+        assert_eq!(command.to_string(), str);
+
+        str = "QUIT :Leaving";
+        command = str.parse().unwrap();
+        assert_eq!(command.to_string(), str);
     }
 }
