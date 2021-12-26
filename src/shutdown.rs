@@ -1,5 +1,7 @@
 use tokio::sync::broadcast;
 
+/// helper struct that receives a single shot "please die now"
+/// while loops can check is_shutdown instead of handling recv inline
 #[derive(Debug)]
 pub struct Shutdown {
     shutdown: bool,
